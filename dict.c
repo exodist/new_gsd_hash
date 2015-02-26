@@ -253,18 +253,21 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
             continue;
         }
 
+        // If we have one empty, and one populated, wrangle them into the
+        // correct pointers so we don't copy and paste logic.
         node **parent = NULL;
         node  *child  = NULL;
-
         if (left == &BLOCK) {
             parent = &(us->right);
             child  = left;
         }
-        else { // right == &BLOCK
+        else if (right == &BLOCK) {
             parent = &(us->left);
             child  = right;
         }
 
+        // Block the path, do the swap, unblock if swap fails
+        // but only if we have one free and one populated, otherwise keep going.
         if (parent && child) {
             if(!atomic_swap_node(parent, &child, &BLOCK)) continue; // Awe shucks
             if(atomic_swap_node(branch, &us, child))      break;    // Yay!
@@ -272,22 +275,26 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
             continue;
         }
 
-        // Both branches have nodes
+        // Both branches have nodes, now it is complicated...
+        // Find best strategy (left into right or right into left)
+
+        // Get some objects to work with
         size_t rhash = __atomic_load_n(&(right->hash), __ATOMIC_CONSUME);
         size_t lhash = __atomic_load_n(&(left->hash),  __ATOMIC_CONSUME);
-
         kv rkey = atomic_read_kv(&(right->key));
         kv lkey = atomic_read_kv(&(left->key));
-        if (!rkey || !lkey) continue; // Child node deleted, retry.
 
-        // Find best strategy (left into right, right into left)
+        // Child node deleted, retry.
+        if (!rkey || !lkey) continue;
+
+        // Map out both paths
         node **lbranch = NULL;
         node **rbranch = NULL;
-
         size_t ldepth = find_branch(left,  rhash, rkey, &lbranch);
         size_t rdepth = find_branch(right, lhash, lkey, &rbranch);
 
-        node **prune  = NULL;
+        // Pick the short path
+        node **prune = NULL;
         if (ldepth >= rdepth) {
             prune  = &(us->left);
             parent = rbranch;
@@ -299,15 +306,19 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
             child  = right;
         }
 
+        // Reserve the short path
         if(!atomic_swap_node(parent, NULL, &BLOCK)) continue;
-
+        // Block the path we are moving
         if(!atomic_swap_node(prune, &child, &BLOCK)) {
+            // Ooops, start over :-(
             atomic_write_node(parent, NULL); // Be Kind ReWind
             continue;
         }
 
+        // Success! use our reservation
         atomic_write_node(parent, child);
-        // Loop again now that we have just a left or right branch
+
+        // Loop again now that we have just a left or right branch (reuse the existing logic).
     }
 
     // atomic nullify the key
