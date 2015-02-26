@@ -63,7 +63,7 @@ node BLOCK;
 //#########################################################################
 
 // NOTE: Account for NULL value but not NULL key, if value is NULL key is too, ignoring what is actually set
-// NOTE: Account for BLOCK
+// NOTE: Account for BLOCK, if encountered loop
 kv find_node(dict *d, size_t hash, void *key, node ***branch, node **found);
 node **locate_node(dict *d, node *n);
 size_t find_branch(node *from, size_t hash, kv key, node ***branch);
@@ -253,13 +253,22 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
             continue;
         }
 
+        node **parent = NULL;
+        node  *child  = NULL;
+
         if (left == &BLOCK) {
-            if (atomic_swap_node(branch, &us, right)) break;
-            continue;
+            parent = &(us->right);
+            child  = left;
+        }
+        else { // right == &BLOCK
+            parent = &(us->left);
+            child  = right;
         }
 
-        if (right == &BLOCK) {
-            if (atomic_swap_node(branch, &us, left)) break;
+        if (parent && child) {
+            if(!atomic_swap_node(parent, &child, &BLOCK)) continue; // Awe shucks
+            if(atomic_swap_node(branch, &us, child))      break;    // Yay!
+            atomic_write_node(parent, child); // Be Kind ReWind (nothing else can unblock it but us)
             continue;
         }
 
@@ -279,8 +288,6 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
         size_t rdepth = find_branch(right, lhash, lkey, &rbranch);
 
         node **prune  = NULL;
-        node **parent = NULL;
-        node  *child  = NULL;
         if (ldepth >= rdepth) {
             prune  = &(us->left);
             parent = rbranch;
@@ -292,13 +299,15 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
             child  = right;
         }
 
-        if(!atomic_swap_node(parent, NULL, child)) continue;
+        if(!atomic_swap_node(parent, NULL, &BLOCK)) continue;
 
         if(!atomic_swap_node(prune, &child, &BLOCK)) {
-            // Unable to prune, remove the child from the parent so we can try
-            // again, it was unreachable via the nested path, so this is safe.
-            atomic_write_node(parent, NULL);
+            atomic_write_node(parent, NULL); // Be Kind ReWind
+            continue;
         }
+
+        atomic_write_node(parent, child);
+        // Loop again now that we have just a left or right branch
     }
 
     // atomic nullify the key
@@ -307,6 +316,7 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
     atomic_write_kv(&(found->key), NULL);
 
     // put node in garbage
+    // TODO
 
     leave_epoch(d, e);
     return cval;
