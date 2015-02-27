@@ -1,10 +1,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef struct dict dict;
+typedef struct dict      dict;
+typedef struct dict_iter dict_iter;
 
 dict *dict_create(size_t base);
 void  dict_free(dict *d);
+
+dict_iter *dict_iter_create(dict *d);
+void      *dict_iter_free(dict_iter *i);
 
 /*
  * ALL operations are atomic unless otherwise noted, also completely thread
@@ -42,3 +46,17 @@ void *dict_check(dict *d, uint64_t hash, void *key);
  * Return the newly set value.
  */
 void *dict_set(dict *d, uint64_t hash, void *key, void *newval);
+
+
+// Iterate through all key/value pairs
+// Note: Inserting nodes while iterating has undefined results, some may be
+// seen, others may not be.
+// _start functions reset the iterator
+// _next get the next in sequence
+// the order for the pairs returned is not defined.
+size_t dict_iter_start(dict_iter *i, void **key, void **val);
+size_t dict_iter_next (dict_iter *i, void **key, void **val);
+void *dict_iter_start_key(dict_iter *i);
+void *dict_iter_next_key (dict_iter *i);
+void *dict_iter_start_val(dict_iter *i);
+void *dict_iter_next_val (dict_iter *i);

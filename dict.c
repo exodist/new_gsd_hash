@@ -47,11 +47,12 @@ struct dict {
 
     store *curr_store; // points at root store until full, then next store
     store *root_store; // points into data section
-    node  *hash_table; // points into data section
+    node **hash_table; // points into data section
 
-    size_t  procs[2]; // Count of in-progress calls
-    node *garbage[2]; // List of garbage to free
-    int8_t epoch;     // Current epoch (0 or 1)
+    size_t  active[2];      // Count of in-progress calls
+    node   *dead_nodes[2];  // List of nodes to return
+    store  *dead_stores[2]; // List of stores to free
+    int8_t  epoch;          // Current epoch (0 or 1)
 
     uint8_t data[];
 };
@@ -62,15 +63,17 @@ node BLOCK;
 
 //#########################################################################
 
-// NOTE: Account for NULL value but not NULL key, if value is NULL key is too, ignoring what is actually set
-// NOTE: Account for BLOCK, if encountered loop
-kv find_node(dict *d, size_t hash, void *key, node ***branch, node **found);
+kv find_node(dict *d, size_t hash, kv key, node ***branch, node **found);
 node **locate_node(dict *d, node *n);
 size_t find_branch(node *from, size_t hash, kv key, node ***branch);
+
+int compare_node(node *n, size_t hash, kv key, kv *val);
 
 node *alloc_node(dict *d, uintptr_t ptr);
 
 void unalloc_node(dict *d, node *n);
+
+void dispose_node(dict *d, node *n);
 
 int  join_epoch(dict *d);
 void leave_epoch(dict *d, int epoch);
@@ -106,7 +109,7 @@ dict *dict_create(size_t base) {
     d->store_size  = store_size;
     d->table_size  = table_size;
 
-    d->hash_table = (node *)&(d->data);
+    d->hash_table = (node **)&(d->data);
     d->root_store = (store *)&(d->data[table_size]);
     d->curr_store = d->root_store;
 
@@ -117,12 +120,16 @@ dict *dict_create(size_t base) {
 
 void dict_free(dict *d) {
     __atomic_store_n(&(d->epoch), -1, __ATOMIC_SEQ_CST);
-    // TODO: Wait on epochs
+
+    while(__atomic_load_n(d->active + 0, __ATOMIC_CONSUME) || __atomic_load_n(d->active + 1, __ATOMIC_CONSUME)) {
+        // wait...
+    }
+
     store *s = d->root_store;
     while (s) {
         store *kill = s;
         s = s->next;
-        free(kill);
+        if (s != d->root_store) free(kill);
     }
     free(d);
 }
@@ -321,17 +328,177 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
         // Loop again now that we have just a left or right branch (reuse the existing logic).
     }
 
-    // atomic nullify the key
-    // This must come AFTER changing the tree to ensure we can find direction
-    // on a hash conflict.
-    atomic_write_kv(&(found->key), NULL);
-
     // put node in garbage
-    // TODO
+    dispose_node(d, found);
 
     leave_epoch(d, e);
     return cval;
 }
+
+//#########################################################################
+
+/*
+struct node {
+    size_t hash;
+
+    kv key;
+    kv val;
+
+    node *left;
+    node *right;
+};
+
+struct store {
+    dict *d;
+
+    size_t index;
+    size_t free_count;
+
+    store *next;
+    node  *free;
+
+    store *left;
+    store *right;
+
+    node nodes[];
+};
+
+struct dict {
+    size_t base;
+
+    size_t store_count; // 2 x base
+    size_t table_count; // 4 x base
+
+    size_t store_size;  // 2 x base x sizeof(node)
+    size_t table_size;  // 4 x base x sizeof(node *)
+
+    store *curr_store; // points at root store until full, then next store
+    store *root_store; // points into data section
+    node  *hash_table; // points into data section
+
+    size_t  active[2];      // Count of in-progress calls
+    node   *dead_nodes[2];  // List of nodes to return
+    store  *dead_stores[2]; // List of stores to free
+    int8_t  epoch;          // Current epoch (0 or 1)
+
+    uint8_t data[];
+};
+
+ */
+
+kv find_node(dict *d, size_t hash, kv key, node ***branch, node **found) {
+    // Find the table entry
+    size_t table_idx = hash % d->table_count;
+    node **table_slot = d->hash_table + table_idx;
+
+    // Empty slot
+    node **link = table_slot;
+    node *curr = atomic_read_node(link);
+
+    while(curr) {
+        kv val = NULL;
+
+        // start over if we got blocked.
+        if (curr == &BLOCK) {
+            link = table_slot;
+            curr = atomic_read_node(link);
+        }
+
+        int dir = compare_node(curr, hash, key, &val);
+        switch(dir) {
+            case 0:
+                *branch = link;
+                *found  = curr;
+            return val;
+
+            case -1:
+            case -2:
+                link = &(curr->left);
+            break;
+
+            case 1:
+                link = &(curr->right);
+            break;
+
+            default: assert(dir >= -2 && dir <= 1);
+        };
+
+        curr = atomic_read_node(link);
+    }
+
+    *branch = link;
+    *found = NULL;
+    return NULL;
+}
+
+int compare_node(node *n, size_t hash, kv key, kv *val) {
+    // Key and hash do not change until a node is ready to be recycled, if that
+    // happens val will be NULL and we will use that as our final check.
+
+    *val = NULL;
+
+    size_t nhash = n->hash;
+    if (hash > nhash) return  1;
+    if (hash < nhash) return -1;
+
+    // Same hash!
+    kv nkey = n->key;
+    if (key > nkey) return  1;
+    if (key < nkey) return -1;
+
+    // Same key!
+    kv v = atomic_read_kv(&(n->val));
+    if (v == NULL) return -2; // Deleted, keep looking, go left
+
+    if (val) *val = v;
+    return 0; // Node match, val is not NULL
+}
+
+node **locate_node(dict *d, node *n) {
+    size_t table_idx = n->hash % d->table_count;
+    node **table_slot = d->hash_table + table_idx;
+    node **link = table_slot;
+    node  *curr = atomic_read_node(link);
+
+    while(curr) {
+        if (curr == n) return link;
+
+        if (curr == &BLOCK) {
+            link = table_slot;
+            curr = atomic_read_node(link);
+            continue;
+        }
+
+        int dir = compare_node(curr, n->hash, n->key, NULL);
+        switch(dir) {
+            case -1:
+            case -2:
+                link = &(curr->left);
+            break;
+
+            case 1:
+                link = &(curr->right);
+            break;
+
+            default: assert(dir && dir >= -2 && dir <= 1);
+        };
+
+        curr = atomic_read_node(link);
+    }
+
+    return NULL;
+}
+
+size_t find_branch(node *from, size_t hash, kv key, node ***branch);
+
+node *alloc_node(dict *d, uintptr_t ptr);
+
+void unalloc_node(dict *d, node *n);
+
+void dispose_node(dict *d, node *n);
+
+int  join_epoch(dict *d);
+void leave_epoch(dict *d, int epoch);
 
 //#########################################################################
 
