@@ -337,55 +337,6 @@ void *dict_remove(dict *d, uint64_t hash, void *key, void *oldval) {
 
 //#########################################################################
 
-/*
-struct node {
-    size_t hash;
-
-    kv key;
-    kv val;
-
-    node *left;
-    node *right;
-};
-
-struct store {
-    dict *d;
-
-    size_t index;
-    size_t free_count;
-
-    store *next;
-    node  *free;
-
-    store *left;
-    store *right;
-
-    node nodes[];
-};
-
-struct dict {
-    size_t base;
-
-    size_t store_count; // 2 x base
-    size_t table_count; // 4 x base
-
-    size_t store_size;  // 2 x base x sizeof(node)
-    size_t table_size;  // 4 x base x sizeof(node *)
-
-    store *curr_store; // points at root store until full, then next store
-    store *root_store; // points into data section
-    node  *hash_table; // points into data section
-
-    size_t  active[2];      // Count of in-progress calls
-    node   *dead_nodes[2];  // List of nodes to return
-    store  *dead_stores[2]; // List of stores to free
-    int8_t  epoch;          // Current epoch (0 or 1)
-
-    uint8_t data[];
-};
-
- */
-
 kv find_node(dict *d, size_t hash, kv key, node ***branch, node **found) {
     // Find the table entry
     size_t table_idx = hash % d->table_count;
@@ -489,7 +440,82 @@ node **locate_node(dict *d, node *n) {
     return NULL;
 }
 
-size_t find_branch(node *from, size_t hash, kv key, node ***branch);
+/*
+struct node {
+    size_t hash;
+
+    kv key;
+    kv val;
+
+    node *left;
+    node *right;
+};
+
+struct store {
+    dict *d;
+
+    size_t index;
+    size_t free_count;
+
+    store *next;
+    node  *free;
+
+    store *left;
+    store *right;
+
+    node nodes[];
+};
+
+struct dict {
+    size_t base;
+
+    size_t store_count; // 2 x base
+    size_t table_count; // 4 x base
+
+    size_t store_size;  // 2 x base x sizeof(node)
+    size_t table_size;  // 4 x base x sizeof(node *)
+
+    store *curr_store; // points at root store until full, then next store
+    store *root_store; // points into data section
+    node  *hash_table; // points into data section
+
+    size_t  active[2];      // Count of in-progress calls
+    node   *dead_nodes[2];  // List of nodes to return
+    store  *dead_stores[2]; // List of stores to free
+    int8_t  epoch;          // Current epoch (0 or 1)
+
+    uint8_t data[];
+};
+
+ */
+
+
+size_t find_branch(node *from, size_t hash, kv key, node ***branch) {
+    size_t depth = 0;
+    node *curr = from;
+
+    while (curr) {
+        depth++;
+
+        int dir = compare_node(from, hash, key, NULL);
+        switch(dir) {
+            case -1:
+            case -2:
+                *branch = &(curr->left);
+            break;
+
+            case 1:
+                *branch = &(curr->right);
+            break;
+
+            default: assert(dir && dir >= -2 && dir <= 1);
+        };
+
+        curr = atomic_read_node(*branch);
+    }
+
+    return depth;
+}
 
 node *alloc_node(dict *d, uintptr_t ptr);
 
